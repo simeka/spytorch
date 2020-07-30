@@ -11,17 +11,6 @@ import torch.nn as nn
 import torchvision
 np.random.seed(12345)
 
-def compute_classification_accuracy(x_data, y_data):
-    """ Computes classification accuracy on supplied data in batches. """
-    accs = []
-    for x_local, y_local in sparse_data_generator(x_data, y_data, batch_size, nb_steps, nb_inputs, shuffle=False):
-        output,_ = run_snn(x_local.to_dense())
-        m,_= torch.max(output,1) # max over time
-        _,am=torch.max(m,1)      # argmax over output units
-        tmp = np.mean((y_local==am).detach().cpu().numpy()) # compare to labels
-        accs.append(tmp)
-    return np.mean(accs)
-
 def current2firing_time(x, tau=20, thr=0.2, tmax=1.0, epsilon=1e-7):
     """ Computes first firing time latency for a current input x assuming the charge time of a current based LIF neuron.
 
@@ -273,6 +262,23 @@ def error(spk_rec, labels, target_window=(1, 120), dflt_spk=35):
     err_rec = torch.stack(err_rec, dim=1)
     return err_rec
 
+def classification_accuracy(spk_rec, labels, target_window=(1, 80)):
+    start, end = target_window
+
+    # there is no spike but there should be
+    inside_mask = torch.zeros(batch_size, dtype=bool, requires_grad=False)
+    outside_mask = torch.zeros(batch_size, dtype=bool, requires_grad=False)
+    outside = torch.ones(nb_steps+1, dtype=bool, requires_grad=False)  # (n_batches, time, n_outputs)
+    outside[start:end] = False
+
+    for o in range(nb_outputs):
+        inside_mask[labels == o] = torch.sum(spk_rec[labels == o, start:end, o], dim=1, dtype=bool)
+        outside_mask[labels == o] = torch.sum(spk_rec[labels == o, :start, o], dim=1, dtype=bool)
+        outside_mask[labels == o] += torch.sum(spk_rec[labels == o, end:, o], dim=1, dtype=bool)
+
+    accuracy = inside_mask & ~outside_mask
+    acc = np.mean(accuracy.detach().cpu().numpy())
+    return acc
 
 if __name__ == "__main__":
     nb_inputs = 28 * 28
@@ -330,11 +336,13 @@ if __name__ == "__main__":
     # start training
     gc.collect()
     print("start training")
-    nb_epochs = 50
-    subset = 1024
+    nb_epochs = 20
+    subset = 512
     totalloss = []
+    totalacc = []
     for e in range(nb_epochs):
         loss = []
+        acc = []
         for x_local, y_local in sparse_data_generator(x_train[:subset], y_train[:subset], batch_size, nb_steps, nb_inputs):
             out_rec, hidden_rec = run_snn(x_local.to_dense())
 
@@ -348,6 +356,8 @@ if __name__ == "__main__":
             err = torch.einsum("abd,dc->abc", (err_o, w2.T))
             grad = torch.mean(torch.einsum("abdc, abd->acd", (eltr_rec, err)), dim=0)
 
+            # acc (before update!)
+            acc.append(classification_accuracy(out_rec[1], y_local))
             # calculate gradients
             optimizer.zero_grad()
             w2.grad = -grad_o
@@ -357,17 +367,14 @@ if __name__ == "__main__":
             print(loss[-1])
         gc.collect()
         totalloss.append(np.mean(loss))
-        print("%s/40: av. loss = %s" % (e, totalloss[-1]))
+        totalacc.append(np.mean(acc))
+        print("%s/40: av. loss = %s, acc = %s" % (e, totalloss[-1], totalacc[-1]))
 
-    plt.figure(figsize=(3.3,2),dpi=150)
-    #plt.plot(loss_hist_true_grad, label="True gradient")
-    plt.plot(totalloss, label="Surrogate gradient")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
+    fig, axes = plt.subplots(2, sharex=True, figsize=(3, 3))
+    axes[0].plot(totalloss)
+    axes[1].plot(totalacc)
+    axes[0].set_ylabel("Loss")
+    axes[1].set_ylabel("Training Accuracy")
+    axes[1].set_xlabel("Epoch")
     sns.despine()
     plt.savefig("loss.pdf")
-
-    subset = 256
-    print("Training accuracy: %.3f" % (compute_classification_accuracy(x_train[:subset], y_train[:subset])))
-    print("Test accuracy: %.3f" % (compute_classification_accuracy(x_test[:subset], y_test[:subset])))
